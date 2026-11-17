@@ -2,7 +2,6 @@ package com.example.system
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.ActivityManager
 import android.app.ActivityOptions
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -29,6 +28,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import android.speech.SpeechRecognizer
+import android.util.LruCache
 import android.view.Display
 import android.view.KeyEvent
 import androidx.compose.ui.graphics.ImageBitmap
@@ -47,6 +47,29 @@ sealed interface ToggleResult {
 }
 
 object SystemBridges {
+
+  @Volatile
+  private var cachedSpeechAvailable: Boolean? = null
+  @Volatile
+  private var latestTorchState: Boolean = false
+  @Volatile
+  private var cachedLaunchableApps: List<LaunchableAppInfo>? = null
+  @Volatile
+  private var cachedLaunchableAppsTimestampMs: Long = 0L
+  private const val LAUNCHABLE_APPS_TTL_MS = 60_000L
+  private val appLabelCache = LruCache<String, String>(96)
+  private val scaledAppIconCache = LruCache<String, ImageBitmap>(48)
+
+  fun isTorchEnabled(): Boolean = latestTorchState
+
+  fun updateObservedTorchState(enabled: Boolean) {
+    latestTorchState = enabled
+  }
+
+  fun invalidateLaunchableAppsCache() {
+    cachedLaunchableApps = null
+    cachedLaunchableAppsTimestampMs = 0L
+  }
 
   fun isOverlayPermissionGranted(context: Context): Boolean =
     Settings.canDrawOverlays(context)
@@ -71,8 +94,12 @@ object SystemBridges {
     ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
       PackageManager.PERMISSION_GRANTED
 
-  fun isSpeechRecognitionAvailable(context: Context): Boolean =
-    runCatching { SpeechRecognizer.isRecognitionAvailable(context) }.getOrDefault(false)
+  fun isSpeechRecognitionAvailable(context: Context): Boolean {
+    cachedSpeechAvailable?.let { return it }
+    val available = runCatching { SpeechRecognizer.isRecognitionAvailable(context) }.getOrDefault(false)
+    cachedSpeechAvailable = available
+    return available
+  }
 
   fun isLockscreenOverlayEnabled(context: Context): Boolean {
     if (NotchAccessibilityService.isConnected) return true
@@ -115,14 +142,8 @@ object SystemBridges {
     return runCatching { adapter.isEnabled }.getOrDefault(false)
   }
 
-  @Suppress("DEPRECATION")
-  fun isOverlayServiceRunning(context: Context): Boolean {
-    if (NotchAccessibilityService.isConnected) return true
-    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
-    return am.getRunningServices(50).any {
-      it.service.className == NotchOverlayService::class.java.name
-    }
-  }
+  fun isOverlayServiceRunning(context: Context): Boolean =
+    NotchAccessibilityService.isConnected || NotchOverlayService.isServiceRunning
 
   fun openOverlayPermissionSettings(context: Context) {
     val intent =
@@ -314,6 +335,7 @@ object SystemBridges {
           }
       if (flashCameraId == null) return null
       cameraManager.setTorchMode(flashCameraId, enable)
+      latestTorchState = enable
       enable
     }.getOrNull()
   }
@@ -393,8 +415,13 @@ object SystemBridges {
     audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
   }
 
-  fun readBatteryTelemetry(context: Context): Pair<Int, Boolean> {
-    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+  fun readBatteryTelemetry(context: Context, batteryIntent: Intent? = null): Pair<Int, Boolean> {
+    val intent =
+      if (batteryIntent?.action == Intent.ACTION_BATTERY_CHANGED) {
+        batteryIntent
+      } else {
+        context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+      }
     val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
     val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
     val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
@@ -404,25 +431,49 @@ object SystemBridges {
     return percent to charging
   }
 
-  fun queryLaunchableApps(context: Context): List<LaunchableAppInfo> {
+  fun queryLaunchableApps(context: Context, forceRefresh: Boolean = false): List<LaunchableAppInfo> {
+    val now = SystemClock.elapsedRealtime()
+    val existing = cachedLaunchableApps
+    if (!forceRefresh && existing != null && (now - cachedLaunchableAppsTimestampMs) < LAUNCHABLE_APPS_TTL_MS) {
+      return existing
+    }
+
     val pm = context.packageManager
     val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     val resolved = pm.queryIntentActivities(intent, 0)
-    return resolved
-      .asSequence()
-      .mapNotNull { info ->
-        val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
-        if (pkg == context.packageName) return@mapNotNull null
-        val label = info.loadLabel(pm)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
-        LaunchableAppInfo(packageName = pkg, label = label)
-      }
-      .distinctBy { it.packageName }
-      .sortedBy { it.label.lowercase() }
-      .toList()
+    val apps =
+      resolved
+        .asSequence()
+        .mapNotNull { info ->
+          val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
+          if (pkg == context.packageName) return@mapNotNull null
+          val label = info.loadLabel(pm)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
+          LaunchableAppInfo(packageName = pkg, label = label)
+        }
+        .distinctBy { it.packageName }
+        .sortedBy { it.label.lowercase() }
+        .toList()
+    cachedLaunchableApps = apps
+    cachedLaunchableAppsTimestampMs = now
+    return apps
   }
 
   fun loadAppIcon(context: Context, packageName: String): Drawable? =
     runCatching { context.packageManager.getApplicationIcon(packageName) }.getOrNull()
+
+  fun loadCachedScaledAppIcon(
+    context: Context,
+    packageName: String,
+    maxDim: Int = 96,
+  ): ImageBitmap? {
+    if (packageName.isBlank()) return null
+    val cacheKey = "$packageName@$maxDim"
+    scaledAppIconCache.get(cacheKey)?.let { return it }
+    val drawable = loadAppIcon(context, packageName) ?: return null
+    return drawableToScaledImageBitmap(drawable, maxDim = maxDim)?.also { bitmap ->
+      scaledAppIconCache.put(cacheKey, bitmap)
+    }
+  }
 
   fun drawableToScaledImageBitmap(drawable: Drawable?, maxDim: Int = 96): ImageBitmap? {
     if (drawable == null) return null
@@ -455,11 +506,20 @@ object SystemBridges {
     }.getOrNull()
   }
 
-  fun loadAppLabel(context: Context, packageName: String): String =
-    runCatching {
-      val info = context.packageManager.getApplicationInfo(packageName, 0)
-      context.packageManager.getApplicationLabel(info).toString()
-    }.getOrDefault(packageName.substringAfterLast('.'))
+  fun loadAppLabel(context: Context, packageName: String): String {
+    if (packageName.isBlank()) return ""
+    appLabelCache.get(packageName)?.let { return it }
+    val resolved =
+      runCatching {
+        val info = context.packageManager.getApplicationInfo(packageName, 0)
+        context.packageManager.getApplicationLabel(info).toString()
+      }.getOrNull()
+    if (!resolved.isNullOrBlank()) {
+      appLabelCache.put(packageName, resolved)
+      return resolved
+    }
+    return packageName.substringAfterLast('.')
+  }
 
   fun launchApp(context: Context, packageName: String): Boolean {
     val intent = context.packageManager.getLaunchIntentForPackage(packageName) ?: return false

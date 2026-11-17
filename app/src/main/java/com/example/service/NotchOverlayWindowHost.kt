@@ -43,7 +43,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -72,9 +71,9 @@ class NotchOverlayWindowHost(
   private var hitboxParams: WindowManager.LayoutParams? = null
   private var lifecycleOwner: OverlayLifecycleOwner? = null
   private var collectorJob: Job? = null
-  private var shrinkJob: Job? = null
   private var isAttached = false
-  private var wasExpandedOrNotif = false
+  private var lastVisualLayout: AppliedWindowLayout? = null
+  private var lastHitboxLayout: AppliedWindowLayout? = null
 
   fun attach() {
     if (isAttached) return
@@ -89,11 +88,8 @@ class NotchOverlayWindowHost(
 
   fun detach() {
     isAttached = false
-    wasExpandedOrNotif = false
     collectorJob?.cancel()
     collectorJob = null
-    shrinkJob?.cancel()
-    shrinkJob = null
     touchHitboxView?.let { view ->
       runCatching { windowManager.removeView(view) }
     }
@@ -104,6 +100,8 @@ class NotchOverlayWindowHost(
     }
     visualView = null
     visualParams = null
+    lastVisualLayout = null
+    lastHitboxLayout = null
     lifecycleOwner?.destroy()
     lifecycleOwner = null
   }
@@ -140,14 +138,17 @@ class NotchOverlayWindowHost(
         WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
         WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
 
-    // Visual window keeps FIXED width forever -> zero horizontal relayout shake on expand/collapse.
-    // Starts with FLAG_NOT_TOUCHABLE in compact mode so top-left/top-right system pull-downs work freely.
+    // Keep visual window bounds permanently fixed so SurfaceFlinger never reallocates buffers
+    // or resizes across expand/collapse. When compact, FLAG_NOT_TOUCHABLE passes all touches through.
+    val fixedVisualWidth = dpToPx(fixedWidthDp + 24f)
+    val fixedVisualHeight = dpToPx(244f)
+    val initialVisualFlags = baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
     val initialVisualParams =
       WindowManager.LayoutParams(
-        dpToPx(fixedWidthDp + 24f),
-        dpToPx(initialConfig.geometry.compactHeightDp + 12f),
+        fixedVisualWidth,
+        fixedVisualHeight,
         windowType,
-        baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+        initialVisualFlags,
         PixelFormat.TRANSLUCENT,
       ).apply {
         gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
@@ -163,6 +164,15 @@ class NotchOverlayWindowHost(
         }
       }
     visualParams = initialVisualParams
+    lastVisualLayout =
+      AppliedWindowLayout(
+        width = fixedVisualWidth,
+        height = fixedVisualHeight,
+        x = expandedX,
+        y = targetY,
+        flags = initialVisualFlags,
+        visibility = View.VISIBLE,
+      )
 
     val composeView =
       ComposeView(context).apply {
@@ -186,6 +196,7 @@ class NotchOverlayWindowHost(
           val effectiveConfig =
             EntitlementResolver.effectiveConfig(rawConfig, entitlement.isProUnlocked())
           val runtime by app.coordinator.runtimeState.collectAsStateWithLifecycle()
+          val screenInteractive by app.coordinator.isScreenInteractive.collectAsStateWithLifecycle()
 
           MatusNotchTheme(appearance = effectiveConfig.appearance) {
             Box(
@@ -198,6 +209,7 @@ class NotchOverlayWindowHost(
                 coordinator = app.coordinator,
                 expandedWidthDp = fixedWidthDp,
                 isInStudioPreview = false,
+                isScreenInteractive = screenInteractive,
                 onOpenProPaywall = {
                   app.coordinator.closeVoiceListening()
                   runCatching {
@@ -216,17 +228,21 @@ class NotchOverlayWindowHost(
       }
 
     // Separate pill-sized touch hitbox aligned pixel-for-pixel onto the compact notch pill
+    val initialHitboxWidth = dpToPx(initialConfig.geometry.compactWidthDp)
+    val initialHitboxHeight = dpToPx(initialConfig.geometry.compactHeightDp)
+    val initialHitboxX = dpToPx(initialConfig.geometry.offsetXDp)
+    val initialHitboxY = targetY + dpToPx(4f)
     val initialHitboxParams =
       WindowManager.LayoutParams(
-        dpToPx(initialConfig.geometry.compactWidthDp),
-        dpToPx(initialConfig.geometry.compactHeightDp),
+        initialHitboxWidth,
+        initialHitboxHeight,
         windowType,
         baseFlags,
         PixelFormat.TRANSLUCENT,
       ).apply {
         gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        x = dpToPx(initialConfig.geometry.offsetXDp)
-        y = targetY + dpToPx(4f)
+        x = initialHitboxX
+        y = initialHitboxY
         windowAnimations = 0
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
           layoutInDisplayCutoutMode =
@@ -237,6 +253,15 @@ class NotchOverlayWindowHost(
         }
       }
     hitboxParams = initialHitboxParams
+    lastHitboxLayout =
+      AppliedWindowLayout(
+        width = initialHitboxWidth,
+        height = initialHitboxHeight,
+        x = initialHitboxX,
+        y = initialHitboxY,
+        flags = baseFlags,
+        visibility = View.VISIBLE,
+      )
 
     val hitboxView =
       View(context).apply {
@@ -258,7 +283,11 @@ class NotchOverlayWindowHost(
     collectorJob?.cancel()
     collectorJob =
       scope.launch {
-        combine(app.settingsRepository.configFlow, app.coordinator.runtimeState) { cfg, rt ->
+        combine(
+          app.settingsRepository.configFlow,
+          app.coordinator.runtimeState,
+          app.coordinator.isScreenInteractive,
+        ) { cfg, rt, interactive ->
           OverlayWindowState(
             geometry = cfg.geometry,
             expanded =
@@ -266,6 +295,7 @@ class NotchOverlayWindowHost(
                 rt.voiceListening.phase != com.example.model.VoiceListeningPhase.INACTIVE,
             hasNotification = rt.activeNotification != null,
             hiddenInLandscape = cfg.autoHideInLandscape && rt.isLandscapeHidden,
+            screenInteractive = interactive,
           )
         }
           .distinctUntilChanged()
@@ -281,24 +311,33 @@ class NotchOverlayWindowHost(
     val hView = touchHitboxView ?: return
     val hParams = hitboxParams ?: return
 
-    if (state.hiddenInLandscape) {
-      shrinkJob?.cancel()
-      hView.visibility = View.GONE
-      hParams.flags = hParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-      runCatching { windowManager.updateViewLayout(hView, hParams) }
-
-      vView.visibility = View.GONE
-      vParams.flags = vParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-      runCatching { windowManager.updateViewLayout(vView, vParams) }
+    if (state.hiddenInLandscape || !state.screenInteractive) {
+      applyHitboxLayoutIfChanged(
+        hView = hView,
+        hParams = hParams,
+        width = hParams.width,
+        height = hParams.height,
+        x = hParams.x,
+        y = hParams.y,
+        flags = hParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+        visibility = View.GONE,
+      )
+      applyVisualLayoutIfChanged(
+        vView = vView,
+        vParams = vParams,
+        width = vParams.width,
+        height = vParams.height,
+        x = vParams.x,
+        y = vParams.y,
+        flags = vParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+        visibility = View.GONE,
+      )
       return
-    }
-
-    if (vView.visibility != View.VISIBLE) {
-      vView.visibility = View.VISIBLE
     }
 
     val fixedWidthDp = fixedExpandedWidthDp()
     val fixedVisualWidth = dpToPx(fixedWidthDp + 24f)
+    val fixedVisualHeight = dpToPx(244f)
     val expandedX = dpToPx(state.geometry.offsetXDp.coerceIn(-10f, 10f))
     val targetY = dpToPx(state.geometry.offsetYDp)
 
@@ -308,62 +347,133 @@ class NotchOverlayWindowHost(
     val compactHeight = dpToPx(state.geometry.compactHeightDp)
 
     if (state.expanded || state.hasNotification) {
-      wasExpandedOrNotif = true
-      shrinkJob?.cancel()
-
       // Disable compact hitbox so touches inside expanded notch go directly to widgets / banner
-      hView.visibility = View.GONE
-      hParams.flags = hParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-      runCatching { windowManager.updateViewLayout(hView, hParams) }
+      applyHitboxLayoutIfChanged(
+        hView = hView,
+        hParams = hParams,
+        width = hParams.width,
+        height = hParams.height,
+        x = hParams.x,
+        y = hParams.y,
+        flags = hParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+        visibility = View.GONE,
+      )
 
-      // Keep width fixed; make visual window touchable for expanded widgets / tap-to-open notification
-      vParams.flags = vParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-      vParams.x = expandedX
-      vParams.y = targetY
-      vParams.width = fixedVisualWidth
-      vParams.height = dpToPx(if (state.hasNotification) 152f else 236f)
-      runCatching { windowManager.updateViewLayout(vView, vParams) }
+      // Keep visual bounds fixed; only clear FLAG_NOT_TOUCHABLE to receive touches
+      applyVisualLayoutIfChanged(
+        vView = vView,
+        vParams = vParams,
+        width = fixedVisualWidth,
+        height = fixedVisualHeight,
+        x = expandedX,
+        y = targetY,
+        flags = vParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv(),
+        visibility = View.VISIBLE,
+      )
     } else {
       // Immediately pass touches through visual window & activate exact compact pill hitbox
-      vParams.flags = vParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-      vParams.x = expandedX
-      vParams.y = targetY
-      vParams.width = fixedVisualWidth
-      runCatching { windowManager.updateViewLayout(vView, vParams) }
+      applyHitboxLayoutIfChanged(
+        hView = hView,
+        hParams = hParams,
+        width = compactWidth,
+        height = compactHeight,
+        x = compactX,
+        y = compactHitboxY,
+        flags = hParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv(),
+        visibility = View.VISIBLE,
+      )
 
-      hParams.flags = hParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-      hParams.x = compactX
-      hParams.y = compactHitboxY
-      hParams.width = compactWidth
-      hParams.height = compactHeight
-      hView.visibility = View.VISIBLE
-      runCatching { windowManager.updateViewLayout(hView, hParams) }
-
-      if (wasExpandedOrNotif) {
-        wasExpandedOrNotif = false
-        shrinkJob?.cancel()
-        shrinkJob =
-          scope.launch {
-            delay(290L)
-            vParams.height = dpToPx(state.geometry.compactHeightDp + 12f)
-            runCatching { windowManager.updateViewLayout(vView, vParams) }
-          }
-      } else {
-        shrinkJob?.cancel()
-        vParams.height = dpToPx(state.geometry.compactHeightDp + 12f)
-        runCatching { windowManager.updateViewLayout(vView, vParams) }
-      }
+      applyVisualLayoutIfChanged(
+        vView = vView,
+        vParams = vParams,
+        width = fixedVisualWidth,
+        height = fixedVisualHeight,
+        x = expandedX,
+        y = targetY,
+        flags = vParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+        visibility = View.VISIBLE,
+      )
     }
+  }
+
+  private fun applyVisualLayoutIfChanged(
+    vView: View,
+    vParams: WindowManager.LayoutParams,
+    width: Int,
+    height: Int,
+    x: Int,
+    y: Int,
+    flags: Int,
+    visibility: Int,
+  ) {
+    val target = AppliedWindowLayout(width, height, x, y, flags, visibility)
+    if (target == lastVisualLayout) return
+    val layoutParamsChanged =
+      lastVisualLayout?.let {
+        it.width != width || it.height != height || it.x != x || it.y != y || it.flags != flags
+      } ?: true
+    if (vView.visibility != visibility) {
+      vView.visibility = visibility
+    }
+    if (layoutParamsChanged) {
+      vParams.width = width
+      vParams.height = height
+      vParams.x = x
+      vParams.y = y
+      vParams.flags = flags
+      runCatching { windowManager.updateViewLayout(vView, vParams) }
+    }
+    lastVisualLayout = target
+  }
+
+  private fun applyHitboxLayoutIfChanged(
+    hView: View,
+    hParams: WindowManager.LayoutParams,
+    width: Int,
+    height: Int,
+    x: Int,
+    y: Int,
+    flags: Int,
+    visibility: Int,
+  ) {
+    val target = AppliedWindowLayout(width, height, x, y, flags, visibility)
+    if (target == lastHitboxLayout) return
+    val layoutParamsChanged =
+      lastHitboxLayout?.let {
+        it.width != width || it.height != height || it.x != x || it.y != y || it.flags != flags
+      } ?: true
+    if (hView.visibility != visibility) {
+      hView.visibility = visibility
+    }
+    if (layoutParamsChanged) {
+      hParams.width = width
+      hParams.height = height
+      hParams.x = x
+      hParams.y = y
+      hParams.flags = flags
+      runCatching { windowManager.updateViewLayout(hView, hParams) }
+    }
+    lastHitboxLayout = target
   }
 
   private fun dpToPx(dp: Float): Int =
     (dp * context.resources.displayMetrics.density).roundToInt()
+
+  private data class AppliedWindowLayout(
+    val width: Int,
+    val height: Int,
+    val x: Int,
+    val y: Int,
+    val flags: Int,
+    val visibility: Int,
+  )
 
   private data class OverlayWindowState(
     val geometry: NotchGeometry,
     val expanded: Boolean,
     val hasNotification: Boolean,
     val hiddenInLandscape: Boolean,
+    val screenInteractive: Boolean,
   )
 
   private class OverlayLifecycleOwner :

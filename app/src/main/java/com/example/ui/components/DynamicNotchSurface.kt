@@ -33,10 +33,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredHeight
-import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -126,6 +125,7 @@ fun DynamicNotchSurface(
   coordinator: NotchRuntimeCoordinator,
   expandedWidthDp: Float,
   isInStudioPreview: Boolean,
+  isScreenInteractive: Boolean = true,
   onNavigateToWidgetsTab: (() -> Unit)? = null,
   onOpenProPaywall: (() -> Unit)? = null,
   modifier: Modifier = Modifier,
@@ -147,6 +147,7 @@ fun DynamicNotchSurface(
   val showVoiceCard = isVoiceActive
   val showExpandedWidgets = runtime.isExpanded && !hasNotification && !isVoiceActive
   val showCompact = !isExpandedAny
+  val isSurfaceActive = isInStudioPreview || (!runtime.isLandscapeHidden && isScreenInteractive)
 
   // Silky smooth non-shaking expand/minimize curve (zero overshoot, zero bounce)
   val morphEasing = remember { CubicBezierEasing(0.22f, 1f, 0.36f, 1f) }
@@ -253,7 +254,8 @@ fun DynamicNotchSurface(
   }
 
   val isAmbientGlowStyle =
-    isExpandedAny &&
+    isSurfaceActive &&
+      isExpandedAny &&
       (config.appearance.glowStyle == NotchGlowStyle.BREATHING_AURA ||
         config.appearance.glowStyle == NotchGlowStyle.PRISM_WAVE)
   val ambientPhase =
@@ -289,15 +291,35 @@ fun DynamicNotchSurface(
       label = "compact_extra_x",
     )
 
+  val previewOffsetX by
+    animateDpAsState(
+      targetValue =
+        if (isInStudioPreview) {
+          if (isExpandedAny) config.geometry.offsetXDp.coerceIn(-10f, 10f).dp
+          else config.geometry.offsetXDp.dp
+        } else {
+          0.dp
+        },
+      animationSpec = morphTweenDp,
+      label = "preview_offset_x",
+    )
+
+  val previewOffsetY by
+    animateDpAsState(
+      targetValue =
+        if (isInStudioPreview) {
+          if (isExpandedAny) (config.geometry.offsetYDp * 0.35f).dp
+          else config.geometry.offsetYDp.dp
+        } else {
+          0.dp
+        },
+      animationSpec = morphTweenDp,
+      label = "preview_offset_y",
+    )
+
   val surfaceOffsetModifier =
     if (isInStudioPreview) {
-      val xOff =
-        if (isExpandedAny) config.geometry.offsetXDp.coerceIn(-10f, 10f).dp
-        else config.geometry.offsetXDp.dp
-      val yOff =
-        if (isExpandedAny) (config.geometry.offsetYDp * 0.35f).dp
-        else config.geometry.offsetYDp.dp
-      Modifier.offset(x = xOff, y = yOff)
+      Modifier.offset(x = previewOffsetX, y = previewOffsetY)
     } else {
       Modifier.offset(x = compactExtraOffsetX)
     }
@@ -328,38 +350,23 @@ fun DynamicNotchSurface(
               Modifier
             }
           ),
-      contentAlignment = Alignment.Center,
+      contentAlignment = Alignment.TopCenter,
     ) {
+      val trackPath = remember { Path() }
+      val pathMeasure = remember { PathMeasure() }
+      val ptsX = remember { FloatArray(NOTCH_TRACK_SAMPLES) }
+      val ptsY = remember { FloatArray(NOTCH_TRACK_SAMPLES) }
+      val trackDims = remember { intArrayOf(-1, -1, -1, 0) } // widthPx, heightPx, cornerPx, hasValid(0/1)
+
       // Pill outer frame: draws continuous diffused COB-style LED strip trail synced to live notch size & corner radius
       Box(
         modifier =
           Modifier.width(animatedWidth)
             .height(animatedHeight)
             .drawWithCache {
-              val cornerPx = animatedCorner.toPx()
-              val trackPath =
-                Path().apply {
-                  addRoundRect(
-                    RoundRect(
-                      left = 0f,
-                      top = 0f,
-                      right = size.width,
-                      bottom = size.height,
-                      cornerRadius = CornerRadius(cornerPx, cornerPx),
-                    )
-                  )
-                }
-              val pathMeasure = PathMeasure().apply { setPath(trackPath, forceClosed = true) }
-              val totalLen = pathMeasure.length
-              val ptsX = FloatArray(NOTCH_TRACK_SAMPLES)
-              val ptsY = FloatArray(NOTCH_TRACK_SAMPLES)
-              if (totalLen > 0f) {
-                for (i in 0 until NOTCH_TRACK_SAMPLES) {
-                  val pos = pathMeasure.getPosition((i.toFloat() / NOTCH_TRACK_SAMPLES) * totalLen)
-                  ptsX[i] = pos.x
-                  ptsY[i] = pos.y
-                }
-              }
+              val needsCometTrack =
+                config.appearance.glowStyle == NotchGlowStyle.LED_RACE ||
+                  config.appearance.glowStyle == NotchGlowStyle.DUAL_COMET
 
               val widths =
                 GlowStrokeWidths(
@@ -376,21 +383,65 @@ fun DynamicNotchSurface(
 
               onDrawWithContent {
                 drawContent()
-                if (totalLen > 0f) {
-                  val notifProgress =
-                    if (runtime.notificationPulseId > 0L) notificationLapProgress.value else 0f
-                  drawPerimeterGlow(
-                    style = config.appearance.glowStyle,
-                    progress = notifProgress,
-                    ptsX = ptsX,
-                    ptsY = ptsY,
-                    primaryColor = primaryColor,
-                    secondaryColor = secondaryColor,
-                    widths = widths,
-                    ambientProgress = ambientPhase,
-                    isAmbientActive = isAmbientGlowStyle,
-                  )
+                val notifProgress =
+                  if (runtime.notificationPulseId > 0L) notificationLapProgress.value else 0f
+                val isNotifActive = notifProgress > 0f && notifProgress < 1f
+                if (!isNotifActive && !isAmbientGlowStyle) return@onDrawWithContent
+
+                val cornerPx = animatedCorner.toPx()
+                if (
+                  isNotifActive &&
+                  needsCometTrack &&
+                  size.width > 0f &&
+                  size.height > 0f
+                ) {
+                  val wInt = size.width.toInt()
+                  val hInt = size.height.toInt()
+                  val cInt = cornerPx.toInt()
+                  if (
+                    trackDims[3] == 0 ||
+                    trackDims[0] != wInt ||
+                    trackDims[1] != hInt ||
+                    trackDims[2] != cInt
+                  ) {
+                    trackPath.reset()
+                    trackPath.addRoundRect(
+                      RoundRect(
+                        left = 0f,
+                        top = 0f,
+                        right = size.width,
+                        bottom = size.height,
+                        cornerRadius = CornerRadius(cornerPx, cornerPx),
+                      )
+                    )
+                    pathMeasure.setPath(trackPath, forceClosed = true)
+                    val totalLen = pathMeasure.length
+                    if (totalLen > 0f) {
+                      for (i in 0 until NOTCH_TRACK_SAMPLES) {
+                        val pos = pathMeasure.getPosition((i.toFloat() / NOTCH_TRACK_SAMPLES) * totalLen)
+                        ptsX[i] = pos.x
+                        ptsY[i] = pos.y
+                      }
+                      trackDims[0] = wInt
+                      trackDims[1] = hInt
+                      trackDims[2] = cInt
+                      trackDims[3] = 1
+                    }
+                  }
                 }
+
+                drawPerimeterGlow(
+                  style = config.appearance.glowStyle,
+                  progress = notifProgress,
+                  cornerPx = cornerPx,
+                  ptsX = if (trackDims[3] == 1) ptsX else null,
+                  ptsY = if (trackDims[3] == 1) ptsY else null,
+                  primaryColor = primaryColor,
+                  secondaryColor = secondaryColor,
+                  widths = widths,
+                  ambientProgress = ambientPhase,
+                  isAmbientActive = isAmbientGlowStyle,
+                )
               }
             }
             .semantics {
@@ -460,6 +511,7 @@ fun DynamicNotchSurface(
                 runtime = runtime,
                 primaryColor = primaryColor,
                 secondaryColor = secondaryColor,
+                isSurfaceActive = isSurfaceActive,
               )
             }
           }
@@ -468,8 +520,9 @@ fun DynamicNotchSurface(
           if (notificationAlpha > 0.01f && displayBanner != null) {
             Box(
               modifier =
-                Modifier.requiredWidth(expandedWidthDp.dp)
-                  .requiredHeight(FIXED_NOTIFICATION_HEIGHT_DP.dp)
+                Modifier.wrapContentSize(align = Alignment.TopCenter, unbounded = true)
+                  .width(expandedWidthDp.dp)
+                  .height(FIXED_NOTIFICATION_HEIGHT_DP.dp)
                   .graphicsLayer { alpha = notificationAlpha },
             ) {
               NotificationNotchBanner(
@@ -478,6 +531,7 @@ fun DynamicNotchSurface(
                 runtime = runtime,
                 primaryColor = primaryColor,
                 secondaryColor = secondaryColor,
+                isSurfaceActive = isSurfaceActive,
                 onOpenApp = {
                   haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                   coordinator.onNotificationBannerClicked()
@@ -493,8 +547,9 @@ fun DynamicNotchSurface(
           if (voiceAlpha > 0.01f) {
             Box(
               modifier =
-                Modifier.requiredWidth(expandedWidthDp.dp)
-                  .requiredHeight(FIXED_EXPANDED_HEIGHT_DP.dp)
+                Modifier.wrapContentSize(align = Alignment.TopCenter, unbounded = true)
+                  .width(expandedWidthDp.dp)
+                  .height(FIXED_EXPANDED_HEIGHT_DP.dp)
                   .graphicsLayer { alpha = voiceAlpha },
             ) {
               VoiceListeningNotchCard(
@@ -513,8 +568,9 @@ fun DynamicNotchSurface(
           if (expandedWidgetsAlpha > 0.01f) {
             Box(
               modifier =
-                Modifier.requiredWidth(expandedWidthDp.dp)
-                  .requiredHeight(FIXED_EXPANDED_HEIGHT_DP.dp)
+                Modifier.wrapContentSize(align = Alignment.TopCenter, unbounded = true)
+                  .width(expandedWidthDp.dp)
+                  .height(FIXED_EXPANDED_HEIGHT_DP.dp)
                   .graphicsLayer { alpha = expandedWidgetsAlpha },
             ) {
               ExpandedNotchContent(
@@ -524,6 +580,7 @@ fun DynamicNotchSurface(
                 coordinator = coordinator,
                 primaryColor = primaryColor,
                 secondaryColor = secondaryColor,
+                isSurfaceActive = isSurfaceActive,
                 onNavigateToWidgetsTab = onNavigateToWidgetsTab,
               )
             }
@@ -541,6 +598,7 @@ private fun NotificationNotchBanner(
   runtime: NotchRuntimeState,
   primaryColor: Color,
   secondaryColor: Color,
+  isSurfaceActive: Boolean = true,
   onOpenApp: () -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -584,6 +642,7 @@ private fun NotificationNotchBanner(
           runtime = runtime,
           primaryColor = primaryColor,
           size = 26.dp,
+          isSurfaceActive = isSurfaceActive,
         )
         Text(
           text = banner.appName.ifBlank { "Notification" },
@@ -729,6 +788,7 @@ private fun CompactNotchContent(
   runtime: NotchRuntimeState,
   primaryColor: Color,
   secondaryColor: Color,
+  isSurfaceActive: Boolean = true,
 ) {
   Crossfade(
     targetState = runtime.activeCompactHud,
@@ -753,6 +813,7 @@ private fun CompactNotchContent(
           runtime = runtime,
           primaryColor = primaryColor,
           size = (config.geometry.compactHeightDp - 4f).coerceIn(24f, 40f).dp,
+          isSurfaceActive = isSurfaceActive,
         )
 
         // Right Side: Screen Recording -> Active Call -> Media Album Art -> Focus Timer
@@ -760,6 +821,7 @@ private fun CompactNotchContent(
           config = config,
           runtime = runtime,
           primaryColor = primaryColor,
+          isSurfaceActive = isSurfaceActive,
         )
       }
     }
@@ -901,21 +963,26 @@ private fun CompactRightSlot(
   config: NotchConfig,
   runtime: NotchRuntimeState,
   primaryColor: Color,
+  isSurfaceActive: Boolean = true,
 ) {
   val ongoing = runtime.ongoingStatus
   when {
     ongoing.isScreenRecording -> {
-      val pulse =
-        rememberInfiniteTransition(label = "rec_pulse").animateFloat(
-          initialValue = 0.35f,
-          targetValue = 1f,
-          animationSpec =
-            infiniteRepeatable(
-              animation = tween(650, easing = FastOutSlowInEasing),
-              repeatMode = RepeatMode.Reverse,
-            ),
-          label = "rec_alpha",
-        )
+      val pulseAlpha =
+        if (isSurfaceActive) {
+          rememberInfiniteTransition(label = "rec_pulse").animateFloat(
+            initialValue = 0.35f,
+            targetValue = 1f,
+            animationSpec =
+              infiniteRepeatable(
+                animation = tween(650, easing = FastOutSlowInEasing),
+                repeatMode = RepeatMode.Reverse,
+              ),
+            label = "rec_alpha",
+          ).value
+        } else {
+          0.75f
+        }
       Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -929,7 +996,7 @@ private fun CompactRightSlot(
           modifier =
             Modifier.size(7.dp)
               .clip(CircleShape)
-              .background(Color(0xFFFF2A6D).copy(alpha = pulse.value)),
+              .background(Color(0xFFFF2A6D).copy(alpha = pulseAlpha)),
         )
         Text(
           text = "REC",
@@ -1003,6 +1070,7 @@ private fun ExpandedNotchContent(
   coordinator: NotchRuntimeCoordinator,
   primaryColor: Color,
   secondaryColor: Color,
+  isSurfaceActive: Boolean = true,
   onNavigateToWidgetsTab: (() -> Unit)?,
 ) {
   val haptic = LocalHapticFeedback.current
@@ -1045,6 +1113,7 @@ private fun ExpandedNotchContent(
           primaryColor = primaryColor,
           secondaryColor = secondaryColor,
           size = 36.dp,
+          isSurfaceActive = isSurfaceActive,
           onMascotTapped = {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
             coordinator.onMascotTapped()
@@ -1133,6 +1202,7 @@ private fun ExpandedNotchContent(
         config = config,
         runtime = runtime,
         coordinator = coordinator,
+        isVisiblePage = isSurfaceActive && page == pagerState.currentPage,
         onNavigateToWidgetsTab = onNavigateToWidgetsTab,
       )
     }
@@ -1165,6 +1235,7 @@ private fun NotchLeftSlot(
   primaryColor: Color,
   secondaryColor: Color = primaryColor,
   size: Dp,
+  isSurfaceActive: Boolean = true,
   onMascotTapped: (() -> Unit)? = null,
   onMascotLongPressed: (() -> Unit)? = null,
 ) {
@@ -1188,7 +1259,7 @@ private fun NotchLeftSlot(
           size = size,
         )
       "CALL" ->
-        ActiveCallLogoBadge(size = size)
+        ActiveCallLogoBadge(size = size, isSurfaceActive = isSurfaceActive)
       else -> {
         if (onMascotTapped != null) {
           val bounceScale = remember { Animatable(1f) }
@@ -1223,6 +1294,7 @@ private fun NotchLeftSlot(
               state = runtime.mascotState,
               appearance = config.appearance,
               size = size,
+              isActive = isSurfaceActive,
               modifier =
                 Modifier.graphicsLayer {
                   scaleX = bounceScale.value
@@ -1241,6 +1313,7 @@ private fun NotchLeftSlot(
             state = runtime.mascotState,
             appearance = config.appearance,
             size = size,
+            isActive = isSurfaceActive,
           )
         }
       }
@@ -1249,24 +1322,28 @@ private fun NotchLeftSlot(
 }
 
 @Composable
-private fun ActiveCallLogoBadge(size: Dp) {
-  val pulse =
-    rememberInfiniteTransition(label = "call_pulse").animateFloat(
-      initialValue = 0.72f,
-      targetValue = 1f,
-      animationSpec =
-        infiniteRepeatable(
-          animation = tween(750, easing = FastOutSlowInEasing),
-          repeatMode = RepeatMode.Reverse,
-        ),
-      label = "call_scale",
-    )
+private fun ActiveCallLogoBadge(size: Dp, isSurfaceActive: Boolean = true) {
+  val pulseScale =
+    if (isSurfaceActive) {
+      rememberInfiniteTransition(label = "call_pulse").animateFloat(
+        initialValue = 0.72f,
+        targetValue = 1f,
+        animationSpec =
+          infiniteRepeatable(
+            animation = tween(750, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+          ),
+        label = "call_scale",
+      ).value
+    } else {
+      0.92f
+    }
   Box(
     modifier =
       Modifier.size(size)
         .graphicsLayer {
-          scaleX = pulse.value
-          scaleY = pulse.value
+          scaleX = pulseScale
+          scaleY = pulseScale
         }
         .clip(CircleShape)
         .background(StatusSuccess.copy(alpha = 0.22f))

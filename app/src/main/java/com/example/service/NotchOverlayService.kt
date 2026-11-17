@@ -17,6 +17,7 @@ class NotchOverlayService : Service() {
   override fun onCreate() {
     super.onCreate()
     activeInstance = this
+    isServiceRunning = true
     clearLegacyOverlayNotification()
 
     val app = applicationContext as MatusNotchApplication
@@ -56,6 +57,7 @@ class NotchOverlayService : Service() {
 
   override fun onDestroy() {
     super.onDestroy()
+    isServiceRunning = false
     activeInstance = null
     windowHost?.destroy()
     windowHost = null
@@ -89,6 +91,10 @@ class NotchOverlayService : Service() {
     private const val LEGACY_NOTIFICATION_ID = 4091
     const val ACTION_TOGGLE_EXPAND = "com.example.action.TOGGLE_EXPAND"
     const val ACTION_STOP_OVERLAY = "com.example.action.STOP_OVERLAY"
+
+    @Volatile
+    var isServiceRunning: Boolean = false
+      private set
 
     @Volatile
     private var activeInstance: NotchOverlayService? = null

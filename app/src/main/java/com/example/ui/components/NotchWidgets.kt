@@ -1,9 +1,5 @@
 package com.example.ui.components
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.drawable.BitmapDrawable
-import android.graphics.drawable.Drawable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -65,7 +61,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -97,6 +92,7 @@ fun NotchWidgetPage(
   config: NotchConfig,
   runtime: NotchRuntimeState,
   coordinator: NotchRuntimeCoordinator,
+  isVisiblePage: Boolean = true,
   onNavigateToWidgetsTab: (() -> Unit)? = null,
 ) {
   val primaryColor = Color(config.appearance.resolvePrimaryHex())
@@ -108,6 +104,7 @@ fun NotchWidgetPage(
         media = runtime.media,
         primaryColor = primaryColor,
         secondaryColor = secondaryColor,
+        isVisiblePage = isVisiblePage,
         onPlayPause = { coordinator.togglePlayPause() },
         onNext = { coordinator.skipNext() },
         onPrevious = { coordinator.skipPrevious() },
@@ -163,13 +160,14 @@ private fun MediaWidgetCard(
   media: MediaPlaybackState,
   primaryColor: Color,
   secondaryColor: Color,
+  isVisiblePage: Boolean = true,
   onPlayPause: () -> Unit,
   onNext: () -> Unit,
   onPrevious: () -> Unit,
 ) {
   val haptic = LocalHapticFeedback.current
   val wavePhase =
-    if (media.isPlaying) {
+    if (media.isPlaying && isVisiblePage) {
       val infiniteTransition = rememberInfiniteTransition(label = "media_wave")
       infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -713,7 +711,7 @@ private fun AppShortcutsWidgetCard(
       ) {
         displayApps.forEach { pkg ->
           val label = remember(pkg) { SystemBridges.loadAppLabel(context, pkg) }
-          val iconBitmap = remember(pkg) { SystemBridges.loadAppIcon(context, pkg)?.toSafeImageBitmap() }
+          val iconBitmap = remember(pkg) { SystemBridges.loadCachedScaledAppIcon(context, pkg, maxDim = 96) }
           Column(
             modifier =
               Modifier.weight(1f)
@@ -764,20 +762,3 @@ private fun AppShortcutsWidgetCard(
     }
   }
 }
-
-private fun Drawable.toSafeImageBitmap() =
-  runCatching {
-    val bmp =
-      if (this is BitmapDrawable && bitmap != null) {
-        bitmap
-      } else {
-        val w = intrinsicWidth.coerceAtLeast(64)
-        val h = intrinsicHeight.coerceAtLeast(64)
-        Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { created ->
-          val canvas = Canvas(created)
-          setBounds(0, 0, canvas.width, canvas.height)
-          draw(canvas)
-        }
-      }
-    bmp.asImageBitmap()
-  }.getOrNull()

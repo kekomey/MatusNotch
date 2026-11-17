@@ -101,10 +101,10 @@ fun CalculatorWidgetCard(
         )
       }
 
-      // Utility actions: Copy, AC, Backspace
+      // Utility actions: Copy, AC, %, Backspace
       Row(
         modifier = Modifier.fillMaxWidth().weight(0.42f),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
       ) {
         Box(
           modifier =
@@ -123,7 +123,7 @@ fun CalculatorWidgetCard(
             imageVector = Icons.Rounded.ContentCopy,
             contentDescription = "Copy result",
             tint = TextSecondary,
-            modifier = Modifier.size(14.dp),
+            modifier = Modifier.size(13.dp),
           )
         }
 
@@ -152,6 +152,26 @@ fun CalculatorWidgetCard(
             Modifier.weight(1f)
               .fillMaxHeight()
               .clip(RoundedCornerShape(9.dp))
+              .background(primaryColor.copy(alpha = 0.14f))
+              .clickable {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onKey("%")
+              }
+              .testTag("calc_key_pct"),
+          contentAlignment = Alignment.Center,
+        ) {
+          Text(
+            text = "%",
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+            color = primaryColor,
+          )
+        }
+
+        Box(
+          modifier =
+            Modifier.weight(1f)
+              .fillMaxHeight()
+              .clip(RoundedCornerShape(9.dp))
               .background(Color.White.copy(alpha = 0.07f))
               .clickable {
                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -164,7 +184,7 @@ fun CalculatorWidgetCard(
             imageVector = Icons.AutoMirrored.Rounded.Backspace,
             contentDescription = "Backspace",
             tint = TextPrimary,
-            modifier = Modifier.size(14.dp),
+            modifier = Modifier.size(13.dp),
           )
         }
       }

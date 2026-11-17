@@ -10,6 +10,8 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.compose.ui.graphics.ImageBitmap
@@ -18,11 +20,25 @@ import com.example.MatusNotchApplication
 import com.example.model.ActiveCallInfo
 import com.example.model.ActiveNotificationBanner
 import com.example.system.SystemBridges
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class NotchMediaListenerService : NotificationListenerService() {
 
   private var sessionManager: MediaSessionManager? = null
   private var observedController: MediaController? = null
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private var artDecodeJob: Job? = null
+  private val ongoingSyncRunnable = Runnable { syncOngoingSystemStatuses() }
+  private var lastSyncedArtKey: String? = null
+  private var lastSyncedAlbumArt: ImageBitmap? = null
 
   private val sessionsListener =
     MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
@@ -36,12 +52,16 @@ class NotchMediaListenerService : NotificationListenerService() {
       }
 
       override fun onMetadataChanged(metadata: MediaMetadata?) {
+        lastSyncedArtKey = null
         syncFromController(observedController)
       }
     }
 
   override fun onListenerConnected() {
     super.onListenerConnected()
+    if (!serviceScope.isActive) {
+      serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    }
     val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
     sessionManager = manager
     val component = ComponentName(this, NotchMediaListenerService::class.java)
@@ -54,8 +74,22 @@ class NotchMediaListenerService : NotificationListenerService() {
 
   override fun onListenerDisconnected() {
     super.onListenerDisconnected()
+    mainHandler.removeCallbacks(ongoingSyncRunnable)
+    artDecodeJob?.cancel()
+    artDecodeJob = null
+    serviceScope.cancel()
+    lastSyncedArtKey = null
+    lastSyncedAlbumArt = null
     runCatching { sessionManager?.removeOnActiveSessionsChangedListener(sessionsListener) }
     detachController()
+  }
+
+  override fun onDestroy() {
+    mainHandler.removeCallbacks(ongoingSyncRunnable)
+    artDecodeJob?.cancel()
+    artDecodeJob = null
+    serviceScope.cancel()
+    super.onDestroy()
   }
 
   override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -64,7 +98,7 @@ class NotchMediaListenerService : NotificationListenerService() {
     if (posted.packageName == packageName) return
     val notification = posted.notification ?: return
 
-    syncOngoingSystemStatuses()
+    scheduleOngoingStatusSync()
 
     if (posted.isOngoing) return
     if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
@@ -96,10 +130,11 @@ class NotchMediaListenerService : NotificationListenerService() {
 
     if (title.isBlank() && body.isBlank()) return
 
-    val appDrawable =
-      SystemBridges.loadAppIcon(this, pkg)
-        ?: runCatching { notification.smallIcon?.loadDrawable(this) }.getOrNull()
-    val appIcon = SystemBridges.drawableToScaledImageBitmap(appDrawable, maxDim = 96)
+    val appIcon =
+      SystemBridges.loadCachedScaledAppIcon(this, pkg, maxDim = 96)
+        ?: runCatching { notification.smallIcon?.loadDrawable(this) }
+          .getOrNull()
+          ?.let { SystemBridges.drawableToScaledImageBitmap(it, maxDim = 96) }
 
     val postedTime = posted.postTime.takeIf { it > 0L } ?: System.currentTimeMillis()
     app.coordinator.onNotificationPosted(
@@ -117,7 +152,12 @@ class NotchMediaListenerService : NotificationListenerService() {
 
   override fun onNotificationRemoved(sbn: StatusBarNotification?) {
     super.onNotificationRemoved(sbn)
-    syncOngoingSystemStatuses()
+    scheduleOngoingStatusSync()
+  }
+
+  private fun scheduleOngoingStatusSync() {
+    mainHandler.removeCallbacks(ongoingSyncRunnable)
+    mainHandler.postDelayed(ongoingSyncRunnable, 280L)
   }
 
   private fun syncOngoingSystemStatuses() {
@@ -188,14 +228,20 @@ class NotchMediaListenerService : NotificationListenerService() {
   }
 
   private fun detachController() {
+    artDecodeJob?.cancel()
+    artDecodeJob = null
     observedController?.unregisterCallback(controllerCallback)
     observedController = null
     activeController = null
+    lastSyncedArtKey = null
+    lastSyncedAlbumArt = null
   }
 
   private fun syncFromController(controller: MediaController?) {
     val app = applicationContext as? MatusNotchApplication ?: return
     if (controller == null) {
+      artDecodeJob?.cancel()
+      artDecodeJob = null
       app.coordinator.updateExternalMediaSession(
         isPlaying = false,
         title = "No active audio",
@@ -235,17 +281,71 @@ class NotchMediaListenerService : NotificationListenerService() {
         else -> "Connected Audio"
       }
 
-    val artBitmap = extractScaledAlbumArt(meta)
+    val uriKey =
+      meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+        ?: meta?.getString(MediaMetadata.METADATA_KEY_ART_URI)
+        ?: meta?.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
+        ?: ""
+    val artCacheKey = "$pkg|$title|$artist|$uriKey|${meta?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L}"
     val isPlaying = controller.playbackState?.state == PlaybackState.STATE_PLAYING
+
+    if (meta == null) {
+      artDecodeJob?.cancel()
+      artDecodeJob = null
+      lastSyncedArtKey = null
+      lastSyncedAlbumArt = null
+      app.coordinator.updateExternalMediaSession(
+        isPlaying = isPlaying,
+        title = title,
+        artistAndWriters = combinedCredits,
+        sourceApp = appLabel,
+        albumArt = null,
+        hasListenerAccess = true,
+      )
+      return
+    }
+
+    if (artCacheKey == lastSyncedArtKey) {
+      app.coordinator.updateExternalMediaSession(
+        isPlaying = isPlaying,
+        title = title,
+        artistAndWriters = combinedCredits,
+        sourceApp = appLabel,
+        albumArt = lastSyncedAlbumArt,
+        hasListenerAccess = true,
+      )
+      return
+    }
+
+    val immediateArt =
+      if (lastSyncedArtKey?.startsWith("$pkg|$title|") == true) lastSyncedAlbumArt else null
 
     app.coordinator.updateExternalMediaSession(
       isPlaying = isPlaying,
       title = title,
       artistAndWriters = combinedCredits,
       sourceApp = appLabel,
-      albumArt = artBitmap,
+      albumArt = immediateArt,
       hasListenerAccess = true,
     )
+
+    artDecodeJob?.cancel()
+    artDecodeJob =
+      serviceScope.launch {
+        val decoded = withContext(Dispatchers.Default) { extractScaledAlbumArt(meta) }
+        if (!isActive || observedController !== controller) return@launch
+        lastSyncedArtKey = artCacheKey
+        lastSyncedAlbumArt = decoded
+        val latestPlaying = controller.playbackState?.state == PlaybackState.STATE_PLAYING
+        app.coordinator.updateExternalMediaSession(
+          isPlaying = latestPlaying,
+          title = title,
+          artistAndWriters = combinedCredits,
+          sourceApp = appLabel,
+          albumArt = decoded,
+          hasListenerAccess = true,
+        )
+      }
   }
 
   private fun extractScaledAlbumArt(meta: MediaMetadata?): ImageBitmap? {

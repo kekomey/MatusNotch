@@ -1,6 +1,7 @@
 package com.example.service
 
 import android.app.NotificationManager
+import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -8,12 +9,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.database.ContentObserver
+import android.hardware.camera2.CameraManager
+import android.hardware.display.DisplayManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.core.content.ContextCompat
@@ -62,6 +67,9 @@ class NotchRuntimeCoordinator(
   private val _runtimeState = MutableStateFlow(NotchRuntimeState())
   val runtimeState: StateFlow<NotchRuntimeState> = _runtimeState.asStateFlow()
 
+  private val _isScreenInteractive = MutableStateFlow(isDeviceScreenInteractive())
+  val isScreenInteractive: StateFlow<Boolean> = _isScreenInteractive.asStateFlow()
+
   private var wakeJob: Job? = null
   private var sleepCountdownJob: Job? = null
   private var autoCollapseJob: Job? = null
@@ -79,10 +87,12 @@ class NotchRuntimeCoordinator(
   private var lastKnownDndOn: Boolean? = null
   private var lastKnownRingerMode: Int? = null
   private var lastKnownCharging: Boolean? = null
+  private var lastKnownBatteryPercent: Int = -1
   private var notifiedLowBattery = false
   private var lastKnownVolumePercent: Int? = null
   private var lastKnownBrightnessPercent: Int? = null
   private val knownAudioDeviceIds = mutableSetOf<Int>()
+  private val activeTorchCameras = mutableSetOf<String>()
 
   @Volatile
   private var latestConfigSnapshot: NotchConfig = NotchConfig()
@@ -148,21 +158,41 @@ class NotchRuntimeCoordinator(
           AudioManager.RINGER_MODE_CHANGED_ACTION -> syncDndAndSilentState()
           Intent.ACTION_POWER_CONNECTED,
           Intent.ACTION_POWER_DISCONNECTED,
-          Intent.ACTION_BATTERY_CHANGED -> syncBatteryAndChargingAlerts()
+          Intent.ACTION_BATTERY_CHANGED -> syncBatteryAndChargingAlerts(intent)
           "android.media.VOLUME_CHANGED_ACTION" -> {
             val stream =
               intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", AudioManager.STREAM_MUSIC)
             syncVolumeHud(stream)
           }
+          WifiManager.WIFI_STATE_CHANGED_ACTION -> syncWifiState()
+          BluetoothAdapter.ACTION_STATE_CHANGED -> syncBluetoothState()
+          Intent.ACTION_SCREEN_OFF -> onScreenInteractiveChanged(false)
+          Intent.ACTION_SCREEN_ON -> onScreenInteractiveChanged(true)
         }
       }
     }
 
+  private val mainHandler = Handler(Looper.getMainLooper())
+
   private val brightnessObserver =
-    object : ContentObserver(Handler(Looper.getMainLooper())) {
+    object : ContentObserver(mainHandler) {
       override fun onChange(selfChange: Boolean) {
         syncBrightnessHud()
       }
+    }
+
+  private val autoRotateObserver =
+    object : ContentObserver(mainHandler) {
+      override fun onChange(selfChange: Boolean) {
+        syncAutoRotateState()
+      }
+    }
+
+  private val displayListener =
+    object : DisplayManager.DisplayListener {
+      override fun onDisplayAdded(displayId: Int) = syncVirtualDisplayRecordingState()
+      override fun onDisplayRemoved(displayId: Int) = syncVirtualDisplayRecordingState()
+      override fun onDisplayChanged(displayId: Int) = Unit
     }
 
   private val audioDeviceCallback =
@@ -190,10 +220,39 @@ class NotchRuntimeCoordinator(
       }
     }
 
+  private val torchCallback =
+    object : CameraManager.TorchCallback() {
+      override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+        if (enabled) {
+          activeTorchCameras.add(cameraId)
+        } else {
+          activeTorchCameras.remove(cameraId)
+        }
+        val torchEnabled = activeTorchCameras.isNotEmpty()
+        SystemBridges.updateObservedTorchState(torchEnabled)
+        _runtimeState.update { state ->
+          if (state.telemetry.isTorchOn == torchEnabled) state
+          else state.copy(telemetry = state.telemetry.copy(isTorchOn = torchEnabled))
+        }
+      }
+
+      override fun onTorchModeUnavailable(cameraId: String) {
+        if (activeTorchCameras.remove(cameraId)) {
+          val torchEnabled = activeTorchCameras.isNotEmpty()
+          SystemBridges.updateObservedTorchState(torchEnabled)
+          _runtimeState.update { state ->
+            if (state.telemetry.isTorchOn == torchEnabled) state
+            else state.copy(telemetry = state.telemetry.copy(isTorchOn = torchEnabled))
+          }
+        }
+      }
+    }
+
   init {
     syncDndAndSilentState()
     initBaselineHardwareSnapshots()
     registerSystemWatchers()
+    refreshSystemTelemetry()
 
     scope.launch {
       combine(settingsRepository.configFlow, billingManager.entitlementState) { cfg, ent ->
@@ -211,16 +270,40 @@ class NotchRuntimeCoordinator(
         }
       }
     }
-    scope.launch {
-      while (true) {
-        refreshSystemTelemetry()
-        delay(1500L)
+
+    scope.launch(Dispatchers.IO) {
+      runCatching { SystemBridges.queryLaunchableApps(appContext) }
+    }
+  }
+
+  private fun isDeviceScreenInteractive(): Boolean {
+    val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    return runCatching { pm?.isInteractive ?: true }.getOrDefault(true)
+  }
+
+  fun onScreenInteractiveChanged(interactive: Boolean) {
+    if (_isScreenInteractive.value == interactive) return
+    _isScreenInteractive.value = interactive
+    if (!interactive) {
+      sleepCountdownJob?.cancel()
+      autoCollapseJob?.cancel()
+    } else {
+      val cur = _runtimeState.value
+      if (
+        cur.isExpanded &&
+        cur.activeNotification == null &&
+        cur.voiceListening.phase == VoiceListeningPhase.INACTIVE
+      ) {
+        scheduleAutoCollapseIfExpanded()
+      } else {
+        scheduleAutoSleepIfInactive()
       }
     }
   }
 
   private fun initBaselineHardwareSnapshots() {
-    val (_, charging) = SystemBridges.readBatteryTelemetry(appContext)
+    val (batteryPct, charging) = SystemBridges.readBatteryTelemetry(appContext)
+    lastKnownBatteryPercent = batteryPct
     lastKnownCharging = charging
     val (_, volPct, _) = SystemBridges.readVolumeHud(appContext, AudioManager.STREAM_MUSIC)
     lastKnownVolumePercent = volPct
@@ -243,7 +326,12 @@ class NotchRuntimeCoordinator(
           addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
           addAction(Intent.ACTION_POWER_CONNECTED)
           addAction(Intent.ACTION_POWER_DISCONNECTED)
+          addAction(Intent.ACTION_BATTERY_CHANGED)
           addAction("android.media.VOLUME_CHANGED_ACTION")
+          addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+          addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+          addAction(Intent.ACTION_SCREEN_OFF)
+          addAction(Intent.ACTION_SCREEN_ON)
         }
       ContextCompat.registerReceiver(
         appContext,
@@ -257,11 +345,24 @@ class NotchRuntimeCoordinator(
       Settings.System.getUriFor(Settings.System.SCREEN_BRIGHTNESS)?.let { uri ->
         appContext.contentResolver.registerContentObserver(uri, false, brightnessObserver)
       }
+      Settings.System.getUriFor(Settings.System.ACCELEROMETER_ROTATION)?.let { uri ->
+        appContext.contentResolver.registerContentObserver(uri, false, autoRotateObserver)
+      }
+    }
+
+    runCatching {
+      val dm = appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+      dm?.registerDisplayListener(displayListener, mainHandler)
     }
 
     runCatching {
       val am = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-      am?.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper()))
+      am?.registerAudioDeviceCallback(audioDeviceCallback, mainHandler)
+    }
+
+    runCatching {
+      val cm = appContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+      cm?.registerTorchCallback(torchCallback, mainHandler)
     }
   }
 
@@ -291,6 +392,21 @@ class NotchRuntimeCoordinator(
     val listenerGranted = SystemBridges.isNotificationListenerGranted(appContext)
     val activeController = NotchMediaListenerService.activeController
     val virtualDisplayRec = SystemBridges.isVirtualScreenCaptureDisplayActive(appContext)
+
+    val dndOn = SystemBridges.isDndEnabled(appContext)
+    val silentOn = SystemBridges.isSilentModeEnabled(appContext)
+    val wifiOn = SystemBridges.isWifiEnabled(appContext)
+    val bluetoothOn = SystemBridges.isBluetoothEnabled(appContext)
+    val autoRotateOn = SystemBridges.isAutoRotateEnabled(appContext)
+    val torchOn = SystemBridges.isTorchEnabled()
+    val hasOverlayPerm = SystemBridges.isOverlayPermissionGranted(appContext)
+    val hasDndPerm = SystemBridges.isDndPolicyAccessGranted(appContext)
+    val hasBtPerm = SystemBridges.isBluetoothConnectPermissionGranted(appContext)
+    val hasLockscreen = SystemBridges.isLockscreenOverlayEnabled(appContext)
+    val hasWriteSettings = SystemBridges.canWriteSettings(appContext)
+    val hasRecordAudio = SystemBridges.isRecordAudioPermissionGranted(appContext)
+    val speechAvail = SystemBridges.isSpeechRecognitionAvailable(appContext)
+    val overlayRunning = SystemBridges.isOverlayServiceRunning(appContext)
 
     _runtimeState.update { state ->
       val authoritativePlaying =
@@ -333,35 +449,111 @@ class NotchRuntimeCoordinator(
         else if (!listenerGranted) false
         else state.ongoingStatus.isScreenRecording
 
+      val updatedOngoing = state.ongoingStatus.copy(isScreenRecording = recNow)
+      val updatedTelemetry =
+        state.telemetry.copy(
+          batteryPercent = battery,
+          isCharging = charging,
+          isDndOn = dndOn,
+          isSilentOn = silentOn,
+          isWifiOn = wifiOn,
+          isBluetoothOn = bluetoothOn,
+          isAutoRotateOn = autoRotateOn,
+          isTorchOn = torchOn,
+          hasOverlayPermission = hasOverlayPerm,
+          hasNotificationListenerPermission = listenerGranted,
+          hasDndPolicyPermission = hasDndPerm,
+          hasBluetoothPermission = hasBtPerm,
+          hasLockscreenAccess = hasLockscreen,
+          hasWriteSettingsPermission = hasWriteSettings,
+          hasRecordAudioPermission = hasRecordAudio,
+          isSpeechRecognitionAvailable = speechAvail,
+          isOverlayServiceRunning = overlayRunning,
+        )
+
+      if (
+        nextMascot == state.mascotState &&
+        updatedMedia == state.media &&
+        updatedOngoing == state.ongoingStatus &&
+        updatedTelemetry == state.telemetry
+      ) {
+        return@update state
+      }
+
       state.copy(
         mascotState = nextMascot,
         media = updatedMedia,
-        ongoingStatus = state.ongoingStatus.copy(isScreenRecording = recNow),
-        telemetry =
-          state.telemetry.copy(
-            batteryPercent = battery,
-            isCharging = charging,
-            isDndOn = SystemBridges.isDndEnabled(appContext),
-            isSilentOn = SystemBridges.isSilentModeEnabled(appContext),
-            isWifiOn = SystemBridges.isWifiEnabled(appContext),
-            isBluetoothOn = SystemBridges.isBluetoothEnabled(appContext),
-            isAutoRotateOn = SystemBridges.isAutoRotateEnabled(appContext),
-            hasOverlayPermission = SystemBridges.isOverlayPermissionGranted(appContext),
-            hasNotificationListenerPermission = listenerGranted,
-            hasDndPolicyPermission = SystemBridges.isDndPolicyAccessGranted(appContext),
-            hasBluetoothPermission = SystemBridges.isBluetoothConnectPermissionGranted(appContext),
-            hasLockscreenAccess = SystemBridges.isLockscreenOverlayEnabled(appContext),
-            hasWriteSettingsPermission = SystemBridges.canWriteSettings(appContext),
-            hasRecordAudioPermission = SystemBridges.isRecordAudioPermissionGranted(appContext),
-            isSpeechRecognitionAvailable = SystemBridges.isSpeechRecognitionAvailable(appContext),
-            isOverlayServiceRunning = SystemBridges.isOverlayServiceRunning(appContext),
-          ),
+        ongoingStatus = updatedOngoing,
+        telemetry = updatedTelemetry,
       )
     }
   }
 
-  fun syncBatteryAndChargingAlerts() {
-    val (percent, charging) = SystemBridges.readBatteryTelemetry(appContext)
+  private fun syncWifiState() {
+    val wifiOn = SystemBridges.isWifiEnabled(appContext)
+    _runtimeState.update { state ->
+      if (state.telemetry.isWifiOn == wifiOn) state
+      else state.copy(telemetry = state.telemetry.copy(isWifiOn = wifiOn))
+    }
+  }
+
+  private fun syncBluetoothState() {
+    val btOn = SystemBridges.isBluetoothEnabled(appContext)
+    val btPerm = SystemBridges.isBluetoothConnectPermissionGranted(appContext)
+    _runtimeState.update { state ->
+      if (state.telemetry.isBluetoothOn == btOn && state.telemetry.hasBluetoothPermission == btPerm) {
+        state
+      } else {
+        state.copy(
+          telemetry =
+            state.telemetry.copy(
+              isBluetoothOn = btOn,
+              hasBluetoothPermission = btPerm,
+            )
+        )
+      }
+    }
+  }
+
+  private fun syncAutoRotateState() {
+    val autoRotateOn = SystemBridges.isAutoRotateEnabled(appContext)
+    _runtimeState.update { state ->
+      if (state.telemetry.isAutoRotateOn == autoRotateOn) state
+      else state.copy(telemetry = state.telemetry.copy(isAutoRotateOn = autoRotateOn))
+    }
+  }
+
+  private fun syncVirtualDisplayRecordingState() {
+    val virtualDisplayRec = SystemBridges.isVirtualScreenCaptureDisplayActive(appContext)
+    if (virtualDisplayRec) {
+      updateScreenRecording(active = true)
+    } else if (!SystemBridges.isNotificationListenerGranted(appContext)) {
+      updateScreenRecording(active = false)
+    }
+  }
+
+  fun syncBatteryAndChargingAlerts(batteryIntent: Intent? = null) {
+    val (percent, charging) = SystemBridges.readBatteryTelemetry(appContext, batteryIntent)
+    if (
+      percent == lastKnownBatteryPercent &&
+      charging == lastKnownCharging &&
+      _runtimeState.value.telemetry.batteryPercent == percent &&
+      _runtimeState.value.telemetry.isCharging == charging
+    ) {
+      return
+    }
+    lastKnownBatteryPercent = percent
+
+    _runtimeState.update { state ->
+      if (state.telemetry.batteryPercent == percent && state.telemetry.isCharging == charging) {
+        state
+      } else {
+        state.copy(
+          telemetry = state.telemetry.copy(batteryPercent = percent, isCharging = charging)
+        )
+      }
+    }
+
     val prevCharging = lastKnownCharging
     lastKnownCharging = charging
 
@@ -449,7 +641,10 @@ class NotchRuntimeCoordinator(
   }
 
   fun updateOngoingCall(callInfo: ActiveCallInfo?) {
-    _runtimeState.update { it.copy(ongoingStatus = it.ongoingStatus.copy(activeCall = callInfo)) }
+    _runtimeState.update { state ->
+      if (state.ongoingStatus.activeCall == callInfo) state
+      else state.copy(ongoingStatus = state.ongoingStatus.copy(activeCall = callInfo))
+    }
   }
 
   fun openActiveCall() {
@@ -473,13 +668,12 @@ class NotchRuntimeCoordinator(
         } else {
           System.currentTimeMillis()
         }
-      state.copy(
-        ongoingStatus =
-          current.copy(
-            isScreenRecording = active,
-            recordingStartMillis = effectiveStart,
-          )
-      )
+      val nextOngoing =
+        current.copy(
+          isScreenRecording = active,
+          recordingStartMillis = effectiveStart,
+        )
+      if (nextOngoing == current) state else state.copy(ongoingStatus = nextOngoing)
     }
   }
 
@@ -527,12 +721,16 @@ class NotchRuntimeCoordinator(
       }
     }
 
+    val silentNow = ringerNow != AudioManager.RINGER_MODE_NORMAL
     _runtimeState.update { state ->
+      if (state.telemetry.isDndOn == dndNow && state.telemetry.isSilentOn == silentNow) {
+        return@update state
+      }
       state.copy(
         telemetry =
           state.telemetry.copy(
             isDndOn = dndNow,
-            isSilentOn = ringerNow != AudioManager.RINGER_MODE_NORMAL,
+            isSilentOn = silentNow,
           )
       )
     }
@@ -687,10 +885,7 @@ class NotchRuntimeCoordinator(
   }
 
   fun triggerNotificationPulse() {
-    val icon =
-      SystemBridges.drawableToScaledImageBitmap(
-        SystemBridges.loadAppIcon(appContext, appContext.packageName)
-      )
+    val icon = SystemBridges.loadCachedScaledAppIcon(appContext, appContext.packageName, maxDim = 96)
     onNotificationPosted(
       ActiveNotificationBanner(
         packageName = appContext.packageName,
@@ -723,6 +918,10 @@ class NotchRuntimeCoordinator(
         activeNotification = null,
         mascotState = if (shouldPlayWake) MascotState.WAKING_UP else it.mascotState,
       )
+    }
+
+    scope.launch {
+      refreshSystemTelemetry()
     }
 
     scheduleAutoCollapseIfExpanded()
@@ -1138,6 +1337,16 @@ class NotchRuntimeCoordinator(
     albumArt: ImageBitmap?,
     hasListenerAccess: Boolean,
   ) {
+    val nextMedia =
+      MediaPlaybackState(
+        isPlaying = isPlaying,
+        trackTitle = title.ifBlank { if (isPlaying) "Playing Media" else "No active audio" },
+        artistAndWriters =
+          artistAndWriters.ifBlank { sourceApp.ifBlank { "Connected Audio" } },
+        sourceApp = sourceApp,
+        albumArt = albumArt,
+        hasListenerAccess = hasListenerAccess,
+      )
     _runtimeState.update { current ->
       val nextMascot =
         when {
@@ -1146,18 +1355,12 @@ class NotchRuntimeCoordinator(
           current.mascotState == MascotState.LISTENING_MUSIC -> MascotState.IDLE
           else -> current.mascotState
         }
+      if (current.mascotState == nextMascot && current.media == nextMedia) {
+        return@update current
+      }
       current.copy(
         mascotState = nextMascot,
-        media =
-          MediaPlaybackState(
-            isPlaying = isPlaying,
-            trackTitle = title.ifBlank { if (isPlaying) "Playing Media" else "No active audio" },
-            artistAndWriters =
-              artistAndWriters.ifBlank { sourceApp.ifBlank { "Connected Audio" } },
-            sourceApp = sourceApp,
-            albumArt = albumArt,
-            hasListenerAccess = hasListenerAccess,
-          ),
+        media = nextMedia,
       )
     }
     if (!isPlaying) scheduleAutoSleepIfInactive()
@@ -1473,8 +1676,9 @@ class NotchRuntimeCoordinator(
   }
 
   fun setOverlayRunningState(running: Boolean) {
-    _runtimeState.update {
-      it.copy(telemetry = it.telemetry.copy(isOverlayServiceRunning = running))
+    _runtimeState.update { state ->
+      if (state.telemetry.isOverlayServiceRunning == running) state
+      else state.copy(telemetry = state.telemetry.copy(isOverlayServiceRunning = running))
     }
   }
 

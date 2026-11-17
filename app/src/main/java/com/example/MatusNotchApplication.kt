@@ -19,9 +19,10 @@ class MatusNotchApplication : Application() {
 
   override fun onCreate() {
     super.onCreate()
-    // Pre-warm all 4 Maskot Lottie compositions into LottieCompositionCache for zero-blink switching
+    // Pre-warm all 5 Maskot Lottie compositions into LottieCompositionCache for zero-blink switching
     LottieCompositionFactory.fromRawRes(this, R.raw.mascot_idle)
     LottieCompositionFactory.fromRawRes(this, R.raw.mascot_music)
+    LottieCompositionFactory.fromRawRes(this, R.raw.mascot_listening)
     LottieCompositionFactory.fromRawRes(this, R.raw.mascot_sleeping)
     LottieCompositionFactory.fromRawRes(this, R.raw.mascot_wake_wave)
 

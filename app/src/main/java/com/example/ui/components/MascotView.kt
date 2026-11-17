@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -43,11 +44,12 @@ fun MascotView(
   appearance: NotchAppearance,
   size: Dp,
   modifier: Modifier = Modifier,
+  isActive: Boolean = true,
 ) {
   val primaryColor = Color(appearance.resolvePrimaryHex())
   val cd = stringResource(R.string.cd_mascot_avatar)
 
-  // All 5 Lottie compositions hoisted simultaneously & permanently mounted (zero unmount blinks)
+  // Keep Lottie compositions pre-warmed in LottieCompositionFactory while mounting ONLY the visible layer(s)
   val idleComp by rememberLottieComposition(LottieCompositionSpec.RawRes(R.raw.mascot_idle))
   val musicComp by rememberLottieComposition(LottieCompositionSpec.RawRes(R.raw.mascot_music))
   val voiceComp by rememberLottieComposition(LottieCompositionSpec.RawRes(R.raw.mascot_listening))
@@ -104,8 +106,8 @@ fun MascotView(
       ),
     )
 
-  // Solid-back crossfade: outgoing layer stays 100% opaque underneath while incoming fades 0 -> 1 on top.
-  // This prevents the 75% combined-opacity dip ("blink") during WAKING_UP -> IDLE transitions.
+  // Solid-back crossfade: keep outgoing layer underneath at 100% alpha strictly during 120ms fade,
+  // then unmount it so only 1 Lottie hardware layer is ever active at rest.
   var settlingPrevState by remember { mutableStateOf<MascotState?>(null) }
   var lastActiveState by remember { mutableStateOf(state) }
   val incomingAlpha = remember { Animatable(1f) }
@@ -121,114 +123,86 @@ fun MascotView(
   }
 
   val wakeClipSpec = remember { LottieClipSpec.Frame(min = 285, max = 515) }
+  val sleepClipSpec = remember { LottieClipSpec.Frame(min = 0, max = 115) }
+
+  val effectivePrevState =
+    if (state != lastActiveState) lastActiveState else settlingPrevState?.takeIf { it != state }
+  val effectiveIncomingAlpha = if (state != lastActiveState) 0f else incomingAlpha.value
+
+  fun specFor(target: MascotState): Triple<LottieComposition?, LottieClipSpec?, Pair<Int, Float>> =
+    when (target) {
+      MascotState.IDLE -> Triple(idleComp, null, LottieConstants.IterateForever to 1f)
+      MascotState.LISTENING_MUSIC -> Triple(musicComp, null, LottieConstants.IterateForever to 1f)
+      MascotState.LISTENING_VOICE -> Triple(voiceComp, null, LottieConstants.IterateForever to 1f)
+      MascotState.SLEEPING -> Triple(sleepComp, sleepClipSpec, 1 to 1f)
+      MascotState.WAKING_UP -> Triple(wakeComp, wakeClipSpec, 1 to 1.55f)
+    }
 
   Box(
     modifier = modifier.size(size).semantics { contentDescription = cd },
     contentAlignment = Alignment.Center,
   ) {
-    MascotLayer(
-      layerState = MascotState.IDLE,
-      currentState = state,
-      settlingPrevState = settlingPrevState,
-      incomingAlpha = incomingAlpha.value,
-      composition = idleComp,
-      clipSpec = null,
-      iterations = LottieConstants.IterateForever,
-      speed = 1f,
-      dynamicProperties = dynamicProperties,
-    )
-    MascotLayer(
-      layerState = MascotState.LISTENING_MUSIC,
-      currentState = state,
-      settlingPrevState = settlingPrevState,
-      incomingAlpha = incomingAlpha.value,
-      composition = musicComp,
-      clipSpec = null,
-      iterations = LottieConstants.IterateForever,
-      speed = 1f,
-      dynamicProperties = dynamicProperties,
-    )
-    MascotLayer(
-      layerState = MascotState.LISTENING_VOICE,
-      currentState = state,
-      settlingPrevState = settlingPrevState,
-      incomingAlpha = incomingAlpha.value,
-      composition = voiceComp,
-      clipSpec = null,
-      iterations = LottieConstants.IterateForever,
-      speed = 1f,
-      dynamicProperties = dynamicProperties,
-    )
-    MascotLayer(
-      layerState = MascotState.SLEEPING,
-      currentState = state,
-      settlingPrevState = settlingPrevState,
-      incomingAlpha = incomingAlpha.value,
-      composition = sleepComp,
-      clipSpec = null,
-      iterations = LottieConstants.IterateForever,
-      speed = 1f,
-      dynamicProperties = dynamicProperties,
-    )
-    MascotLayer(
-      layerState = MascotState.WAKING_UP,
-      currentState = state,
-      settlingPrevState = settlingPrevState,
-      incomingAlpha = incomingAlpha.value,
-      composition = wakeComp,
-      clipSpec = wakeClipSpec,
-      iterations = 1,
-      speed = 1.55f,
-      dynamicProperties = dynamicProperties,
-    )
+    if (effectivePrevState != null) {
+      key(effectivePrevState) {
+        val (comp, clip, iterAndSpeed) = specFor(effectivePrevState)
+        MascotLayer(
+          isCurrent = false,
+          isPlaying = false,
+          layerAlpha = 1f,
+          layerZIndex = 1f,
+          composition = comp,
+          clipSpec = clip,
+          iterations = iterAndSpeed.first,
+          speed = iterAndSpeed.second,
+          dynamicProperties = dynamicProperties,
+        )
+      }
+    }
+
+    key(state) {
+      val (comp, clip, iterAndSpeed) = specFor(state)
+      MascotLayer(
+        isCurrent = true,
+        isPlaying = isActive,
+        layerAlpha = effectiveIncomingAlpha,
+        layerZIndex = 2f,
+        composition = comp,
+        clipSpec = clip,
+        iterations = iterAndSpeed.first,
+        speed = iterAndSpeed.second,
+        dynamicProperties = dynamicProperties,
+      )
+    }
   }
 }
 
 @Composable
 private fun MascotLayer(
-  layerState: MascotState,
-  currentState: MascotState,
-  settlingPrevState: MascotState?,
-  incomingAlpha: Float,
+  isCurrent: Boolean,
+  isPlaying: Boolean,
+  layerAlpha: Float,
+  layerZIndex: Float,
   composition: LottieComposition?,
   clipSpec: LottieClipSpec?,
   iterations: Int,
   speed: Float,
   dynamicProperties: com.airbnb.lottie.compose.LottieDynamicProperties,
 ) {
-  val isCurrent = layerState == currentState
-  val isPrevSettling = layerState == settlingPrevState && !isCurrent
-
-  val layerAlpha =
-    when {
-      isCurrent -> incomingAlpha
-      isPrevSettling -> 1f
-      else -> 0f
-    }
-
-  val layerZIndex =
-    when {
-      isCurrent -> 2f
-      isPrevSettling -> 1f
-      else -> 0f
-    }
-
   val progress by
     animateLottieCompositionAsState(
       composition = composition,
-      isPlaying = isCurrent,
+      isPlaying = isCurrent && isPlaying,
       iterations = iterations,
       clipSpec = clipSpec,
       speed = speed,
       restartOnPlay = true,
     )
 
-  // Keep LottieAnimation permanently mounted in composition so hardware textures stay warm (zero blink)
   LottieAnimation(
     composition = composition,
     progress = { progress },
     dynamicProperties = dynamicProperties,
-    renderMode = RenderMode.HARDWARE,
+    renderMode = RenderMode.AUTOMATIC,
     contentScale = ContentScale.Fit,
     modifier =
       Modifier.fillMaxSize()

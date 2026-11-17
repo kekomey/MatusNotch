@@ -675,4 +675,101 @@ class ExampleRobolectricTest {
     assertTrue(gatedVoiceState.requiresProUpgrade)
     coordinator.closeVoiceListening()
   }
+
+  @Test
+  fun `performance optimizations cache icons and labels, gate screen interactivity, and keep glow invariants`() {
+    val app = ApplicationProvider.getApplicationContext<MatusNotchApplication>()
+    val coordinator = app.coordinator
+
+    // 1. Lightweight overlay running check & cached label/icon helpers
+    assertFalse(com.example.system.SystemBridges.isOverlayServiceRunning(app))
+    val label1 = com.example.system.SystemBridges.loadAppLabel(app, app.packageName)
+    val label2 = com.example.system.SystemBridges.loadAppLabel(app, app.packageName)
+    assertEquals("MatusNotch", label1)
+    assertEquals(label1, label2)
+
+    val testPkg = "com.test.cachedapp"
+    val testBitmap = android.graphics.Bitmap.createBitmap(192, 192, android.graphics.Bitmap.Config.ARGB_8888)
+    org.robolectric.Shadows.shadowOf(app.packageManager).setApplicationIcon(
+      testPkg,
+      android.graphics.drawable.BitmapDrawable(app.resources, testBitmap),
+    )
+    val icon1 = com.example.system.SystemBridges.loadCachedScaledAppIcon(app, testPkg, maxDim = 96)
+    // Remove icon from PackageManager to prove second call hits LruCache instead of PackageManager
+    org.robolectric.Shadows.shadowOf(app.packageManager).setApplicationIcon(testPkg, null)
+    val icon2 = com.example.system.SystemBridges.loadCachedScaledAppIcon(app, testPkg, maxDim = 96)
+    assertNotNull(icon1)
+    assertTrue(icon1 === icon2)
+    assertEquals(96, icon1?.width)
+    assertEquals(96, icon1?.height)
+
+    // 2. Screen interactive gating updates state cleanly & repeated refresh keeps equal telemetry
+    coordinator.refreshSystemTelemetry()
+    val snapshotBefore = coordinator.runtimeState.value
+    coordinator.refreshSystemTelemetry()
+    assertEquals(snapshotBefore.telemetry, coordinator.runtimeState.value.telemetry)
+
+    assertTrue(coordinator.isScreenInteractive.value)
+    coordinator.onScreenInteractiveChanged(false)
+    assertFalse(coordinator.isScreenInteractive.value)
+    coordinator.onScreenInteractiveChanged(true)
+    assertTrue(coordinator.isScreenInteractive.value)
+
+    // 3. Optimized glow track & prism sampling invariants
+    assertEquals(96, com.example.ui.components.NOTCH_TRACK_SAMPLES)
+    assertEquals(
+      com.example.ui.components.samplePrismColor(0f),
+      com.example.ui.components.samplePrismColor(1f),
+    )
+
+    // 4. Synchronous in-memory config StateFlow updates without waiting on debounced disk I/O
+    val repo = app.settingsRepository
+    val initialOpacity = repo.configFlow.value.appearance.pillOpacity
+    kotlinx.coroutines.runBlocking {
+      repo.updateConfig { it.copy(appearance = it.appearance.copy(pillOpacity = 0.77f)) }
+      assertEquals(0.77f, repo.configFlow.value.appearance.pillOpacity, 0.001f)
+      repo.updateConfig { it.copy(appearance = it.appearance.copy(pillOpacity = initialOpacity)) }
+      assertEquals(initialOpacity, repo.configFlow.value.appearance.pillOpacity, 0.001f)
+    }
+
+    // 5. Calculator '%' operator support & Torch state preservation across telemetry refresh
+    coordinator.onCalculatorInput("AC")
+    listOf("1", "0", "0", "%").forEach { coordinator.onCalculatorInput(it) }
+    assertEquals("1", coordinator.runtimeState.value.calculator.display)
+
+    com.example.system.SystemBridges.updateObservedTorchState(true)
+    assertTrue(com.example.system.SystemBridges.isTorchEnabled())
+    coordinator.refreshSystemTelemetry()
+    assertTrue(coordinator.runtimeState.value.telemetry.isTorchOn)
+    com.example.system.SystemBridges.updateObservedTorchState(false)
+    coordinator.refreshSystemTelemetry()
+    assertFalse(coordinator.runtimeState.value.telemetry.isTorchOn)
+
+    // 6. Battery broadcast early-return keeps telemetry consistent on repeated intents
+    val batteryIntent =
+      android.content.Intent(android.content.Intent.ACTION_BATTERY_CHANGED).apply {
+        putExtra(android.os.BatteryManager.EXTRA_LEVEL, 64)
+        putExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
+        putExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0)
+      }
+    coordinator.syncBatteryAndChargingAlerts(batteryIntent)
+    assertEquals(64, coordinator.runtimeState.value.telemetry.batteryPercent)
+    assertFalse(coordinator.runtimeState.value.telemetry.isCharging)
+    coordinator.syncBatteryAndChargingAlerts(batteryIntent)
+    assertEquals(64, coordinator.runtimeState.value.telemetry.batteryPercent)
+
+    // 7. Launchable apps list caches in memory and invalidateLaunchableAppsCache resets cleanly
+    com.example.system.SystemBridges.invalidateLaunchableAppsCache()
+    val apps1 = com.example.system.SystemBridges.queryLaunchableApps(app)
+    val apps2 = com.example.system.SystemBridges.queryLaunchableApps(app)
+    assertTrue(apps1 === apps2)
+
+    // 8. expand() updates runtimeState immediately on call
+    coordinator.collapse()
+    assertFalse(coordinator.runtimeState.value.isExpanded)
+    coordinator.expand()
+    assertTrue(coordinator.runtimeState.value.isExpanded)
+    coordinator.collapse()
+  }
 }
+

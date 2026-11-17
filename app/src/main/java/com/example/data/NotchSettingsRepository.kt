@@ -17,8 +17,18 @@ import com.example.model.NotchWidgetType
 import com.example.model.NotificationFilterMode
 import com.example.model.PersistedProState
 import com.example.model.WidgetSlot
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -29,11 +39,13 @@ class NotchSettingsRepository(private val context: Context) {
   private val configKey = stringPreferencesKey("notch_config_json_v1")
   private val debugProOverrideKey = booleanPreferencesKey("pro_debug_override_enabled")
 
-  val configFlow: Flow<NotchConfig> =
-    context.notchDataStore.data.map { prefs ->
-      val raw = prefs[configKey]
-      if (raw.isNullOrBlank()) NotchConfig() else decodeConfig(raw)
-    }
+  private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val configLock = Any()
+  private val _configFlow = MutableStateFlow(NotchConfig())
+  private var hasLocalMutation = false
+  private var persistJob: Job? = null
+
+  val configFlow: StateFlow<NotchConfig> = _configFlow.asStateFlow()
 
   val proStateFlow: Flow<PersistedProState> =
     context.notchDataStore.data.map { prefs ->
@@ -42,11 +54,49 @@ class NotchSettingsRepository(private val context: Context) {
       )
     }
 
+  init {
+    ioScope.launch {
+      val prefs = runCatching { context.notchDataStore.data.first() }.getOrNull()
+      val raw = prefs?.get(configKey)
+      synchronized(configLock) {
+        if (!hasLocalMutation && !raw.isNullOrBlank()) {
+          _configFlow.value = decodeConfig(raw)
+        }
+      }
+    }
+  }
+
   suspend fun updateConfig(transform: (NotchConfig) -> NotchConfig) {
-    context.notchDataStore.edit { prefs ->
-      val current = prefs[configKey]?.let(::decodeConfig) ?: NotchConfig()
-      val updated = transform(current)
-      prefs[configKey] = encodeConfig(updated)
+    val changed =
+      synchronized(configLock) {
+        hasLocalMutation = true
+        val current = _configFlow.value
+        val updated = transform(current)
+        if (updated == current) {
+          false
+        } else {
+          _configFlow.value = updated
+          true
+        }
+      }
+    if (changed) {
+      schedulePersist()
+    }
+  }
+
+  private fun schedulePersist() {
+    synchronized(configLock) {
+      persistJob?.cancel()
+      persistJob =
+        ioScope.launch {
+          delay(180L)
+          val snapshot = _configFlow.value
+          runCatching {
+            context.notchDataStore.edit { prefs ->
+              prefs[configKey] = encodeConfig(snapshot)
+            }
+          }
+        }
     }
   }
 
