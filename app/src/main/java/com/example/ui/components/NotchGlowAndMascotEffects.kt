@@ -1,0 +1,412 @@
+package com.example.ui.components
+
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import com.example.model.NotchGlowStyle
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
+
+internal const val NOTCH_TRACK_SAMPLES = 360
+private const val LED_TRAIL_STEPS = 120
+private const val COMET_TRAIL_STEPS = 72
+
+internal class GlowStrokeWidths(
+  val outerMinPx: Float,
+  val outerMaxPx: Float,
+  val midMinPx: Float,
+  val midMaxPx: Float,
+  val coreMinPx: Float,
+  val coreMaxPx: Float,
+  val headOuterHaloPx: Float,
+  val headMidHaloPx: Float,
+  val headCorePx: Float,
+)
+
+internal fun DrawScope.drawPerimeterGlow(
+  style: NotchGlowStyle,
+  progress: Float,
+  ptsX: FloatArray,
+  ptsY: FloatArray,
+  primaryColor: Color,
+  secondaryColor: Color,
+  widths: GlowStrokeWidths,
+  ambientProgress: Float = 0f,
+  isAmbientActive: Boolean = false,
+) {
+  val isNotifActive = progress > 0f && progress < 1f
+
+  if (isNotifActive) {
+    val envelope =
+      when {
+        progress < 0.06f -> progress / 0.06f
+        progress > 0.84f -> (1f - progress) / 0.16f
+        else -> 1f
+      }.coerceIn(0f, 1f)
+
+    when (style) {
+      NotchGlowStyle.LED_RACE -> {
+        drawCometTrail(
+          headFloat = (progress * 2f * NOTCH_TRACK_SAMPLES) % NOTCH_TRACK_SAMPLES,
+          trailSteps = LED_TRAIL_STEPS,
+          envelope = envelope,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          primaryColor = primaryColor,
+          secondaryColor = secondaryColor,
+          widths = widths,
+        )
+      }
+
+      NotchGlowStyle.DUAL_COMET -> {
+        val headA = (progress * 2f * NOTCH_TRACK_SAMPLES) % NOTCH_TRACK_SAMPLES
+        val headB = (headA + NOTCH_TRACK_SAMPLES / 2f) % NOTCH_TRACK_SAMPLES
+        drawCometTrail(
+          headFloat = headA,
+          trailSteps = COMET_TRAIL_STEPS,
+          envelope = envelope,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          primaryColor = primaryColor,
+          secondaryColor = secondaryColor,
+          widths = widths,
+        )
+        drawCometTrail(
+          headFloat = headB,
+          trailSteps = COMET_TRAIL_STEPS,
+          envelope = envelope,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          primaryColor = secondaryColor,
+          secondaryColor = primaryColor,
+          widths = widths,
+        )
+      }
+
+      NotchGlowStyle.BREATHING_AURA -> {
+        val pulse = (0.45f + 0.55f * (0.5f - 0.5f * cos(progress * 6f * PI).toFloat())).coerceIn(0f, 1f)
+        drawUniformPerimeterAura(
+          intensity = envelope * pulse,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          primaryColor = primaryColor,
+          secondaryColor = secondaryColor,
+          widths = widths,
+        )
+      }
+
+      NotchGlowStyle.PRISM_WAVE -> {
+        drawPrismPerimeterWave(
+          phase = progress * 2.5f,
+          envelope = envelope,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          widths = widths,
+        )
+      }
+    }
+  } else if (isAmbientActive) {
+    when (style) {
+      NotchGlowStyle.BREATHING_AURA -> {
+        val breath = 0.20f + 0.22f * (0.5f + 0.5f * sin(ambientProgress * 2f * PI).toFloat())
+        drawUniformPerimeterAura(
+          intensity = breath,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          primaryColor = primaryColor,
+          secondaryColor = secondaryColor,
+          widths = widths,
+        )
+      }
+
+      NotchGlowStyle.PRISM_WAVE -> {
+        drawPrismPerimeterWave(
+          phase = ambientProgress,
+          envelope = 0.34f,
+          ptsX = ptsX,
+          ptsY = ptsY,
+          widths = widths,
+        )
+      }
+
+      else -> Unit
+    }
+  }
+}
+
+private fun DrawScope.drawCometTrail(
+  headFloat: Float,
+  trailSteps: Int,
+  envelope: Float,
+  ptsX: FloatArray,
+  ptsY: FloatArray,
+  primaryColor: Color,
+  secondaryColor: Color,
+  widths: GlowStrokeWidths,
+) {
+  val headIdx = headFloat.toInt() % NOTCH_TRACK_SAMPLES
+  val tailStartIdx = headIdx - trailSteps
+
+  for (step in 0 until trailSteps) {
+    val t = step.toFloat() / (trailSteps - 1).coerceAtLeast(1)
+    val falloff = t * t * (0.35f + 0.65f * t)
+    if (falloff <= 0.005f) continue
+
+    val i0 = ((tailStartIdx + step) % NOTCH_TRACK_SAMPLES + NOTCH_TRACK_SAMPLES) % NOTCH_TRACK_SAMPLES
+    val i1 = (i0 + 1) % NOTCH_TRACK_SAMPLES
+    val p0 = Offset(ptsX[i0], ptsY[i0])
+    val p1 = Offset(ptsX[i1], ptsY[i1])
+    val stripColor = lerp(secondaryColor, primaryColor, t)
+
+    drawLine(
+      color = stripColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.outerMinPx + (widths.outerMaxPx - widths.outerMinPx) * falloff,
+      cap = StrokeCap.Round,
+      alpha = envelope * falloff * 0.24f,
+    )
+    drawLine(
+      color = stripColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.midMinPx + (widths.midMaxPx - widths.midMinPx) * falloff,
+      cap = StrokeCap.Round,
+      alpha = envelope * falloff * 0.85f,
+    )
+    if (t > 0.35f) {
+      val coreT = ((t - 0.35f) / 0.65f).pow(1.45f)
+      val coreColor = lerp(primaryColor, Color.White, coreT * 0.85f)
+      drawLine(
+        color = coreColor,
+        start = p0,
+        end = p1,
+        strokeWidth = widths.coreMinPx + (widths.coreMaxPx - widths.coreMinPx) * coreT,
+        cap = StrokeCap.Round,
+        alpha = envelope * coreT * 0.95f,
+      )
+    }
+  }
+
+  val nextIdx = (headIdx + 1) % NOTCH_TRACK_SAMPLES
+  val frac = headFloat - headFloat.toInt()
+  val headCenter =
+    Offset(
+      x = ptsX[headIdx] + (ptsX[nextIdx] - ptsX[headIdx]) * frac,
+      y = ptsY[headIdx] + (ptsY[nextIdx] - ptsY[headIdx]) * frac,
+    )
+  drawCircle(
+    color = primaryColor,
+    radius = widths.headOuterHaloPx,
+    center = headCenter,
+    alpha = envelope * 0.28f,
+  )
+  drawCircle(
+    color = primaryColor,
+    radius = widths.headMidHaloPx,
+    center = headCenter,
+    alpha = envelope * 0.62f,
+  )
+  drawCircle(
+    color = Color.White,
+    radius = widths.headCorePx,
+    center = headCenter,
+    alpha = envelope * 0.96f,
+  )
+}
+
+private fun DrawScope.drawUniformPerimeterAura(
+  intensity: Float,
+  ptsX: FloatArray,
+  ptsY: FloatArray,
+  primaryColor: Color,
+  secondaryColor: Color,
+  widths: GlowStrokeWidths,
+) {
+  for (i in 0 until NOTCH_TRACK_SAMPLES step 2) {
+    val iNext = (i + 2) % NOTCH_TRACK_SAMPLES
+    val p0 = Offset(ptsX[i], ptsY[i])
+    val p1 = Offset(ptsX[iNext], ptsY[iNext])
+    val blend = 0.5f + 0.5f * sin((i.toFloat() / NOTCH_TRACK_SAMPLES) * 2f * PI).toFloat()
+    val segColor = lerp(primaryColor, secondaryColor, blend)
+
+    drawLine(
+      color = segColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.outerMaxPx * (0.75f + 0.25f * intensity),
+      cap = StrokeCap.Round,
+      alpha = intensity * 0.26f,
+    )
+    drawLine(
+      color = segColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.midMaxPx * 0.8f,
+      cap = StrokeCap.Round,
+      alpha = intensity * 0.72f,
+    )
+    drawLine(
+      color = lerp(segColor, Color.White, 0.45f),
+      start = p0,
+      end = p1,
+      strokeWidth = widths.coreMinPx * 1.3f,
+      cap = StrokeCap.Round,
+      alpha = intensity * 0.65f,
+    )
+  }
+}
+
+private fun DrawScope.drawPrismPerimeterWave(
+  phase: Float,
+  envelope: Float,
+  ptsX: FloatArray,
+  ptsY: FloatArray,
+  widths: GlowStrokeWidths,
+) {
+  for (i in 0 until NOTCH_TRACK_SAMPLES step 2) {
+    val iNext = (i + 2) % NOTCH_TRACK_SAMPLES
+    val p0 = Offset(ptsX[i], ptsY[i])
+    val p1 = Offset(ptsX[iNext], ptsY[iNext])
+    val hue = (((i.toFloat() / NOTCH_TRACK_SAMPLES) + phase) % 1f) * 360f
+    val prismColor = Color.hsl(hue = hue, saturation = 0.92f, lightness = 0.62f)
+
+    drawLine(
+      color = prismColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.outerMaxPx * 0.85f,
+      cap = StrokeCap.Round,
+      alpha = envelope * 0.24f,
+    )
+    drawLine(
+      color = prismColor,
+      start = p0,
+      end = p1,
+      strokeWidth = widths.midMaxPx * 0.88f,
+      cap = StrokeCap.Round,
+      alpha = envelope * 0.82f,
+    )
+    drawLine(
+      color = lerp(prismColor, Color.White, 0.35f),
+      start = p0,
+      end = p1,
+      strokeWidth = widths.coreMinPx * 1.4f,
+      cap = StrokeCap.Round,
+      alpha = envelope * 0.85f,
+    )
+  }
+}
+
+private data class BurstParticleSpec(
+  val angleRad: Float,
+  val maxDistFactor: Float,
+  val radiusFactor: Float,
+  val isStar: Boolean,
+  val useSecondary: Boolean,
+)
+
+@Composable
+fun MascotParticleBurstOverlay(
+  tapId: Long,
+  primaryColor: Color,
+  secondaryColor: Color,
+  modifier: Modifier = Modifier,
+) {
+  val burstProgress = remember { Animatable(1f) }
+  val particles = remember {
+    listOf(
+      BurstParticleSpec(-0.35f, 1.35f, 0.14f, isStar = true, useSecondary = false),
+      BurstParticleSpec(0.28f, 1.45f, 0.12f, isStar = false, useSecondary = true),
+      BurstParticleSpec(0.95f, 1.30f, 0.14f, isStar = true, useSecondary = false),
+      BurstParticleSpec(1.62f, 1.25f, 0.11f, isStar = false, useSecondary = true),
+      BurstParticleSpec(2.25f, 1.38f, 0.13f, isStar = true, useSecondary = true),
+      BurstParticleSpec(2.90f, 1.28f, 0.11f, isStar = false, useSecondary = false),
+      BurstParticleSpec(3.65f, 1.32f, 0.14f, isStar = true, useSecondary = false),
+      BurstParticleSpec(4.45f, 1.25f, 0.11f, isStar = false, useSecondary = true),
+      BurstParticleSpec(5.15f, 1.40f, 0.13f, isStar = true, useSecondary = true),
+      BurstParticleSpec(5.75f, 1.22f, 0.10f, isStar = false, useSecondary = false),
+    )
+  }
+
+  LaunchedEffect(tapId) {
+    if (tapId > 0L) {
+      burstProgress.snapTo(0f)
+      burstProgress.animateTo(
+        targetValue = 1f,
+        animationSpec = tween(durationMillis = 680, easing = FastOutSlowInEasing),
+      )
+    }
+  }
+
+  if (tapId > 0L && burstProgress.value < 0.99f) {
+    Canvas(
+      modifier = modifier.graphicsLayer { clip = false },
+    ) {
+      val p = burstProgress.value
+      val fade = (1f - p).pow(1.25f).coerceIn(0f, 1f)
+      val baseRadius = size.minDimension * 0.52f
+      val center = Offset(size.width / 2f, size.height / 2f)
+
+      // Expanding soft neon shockwave ring
+      drawCircle(
+        color = primaryColor,
+        radius = baseRadius * (0.65f + p * 0.95f),
+        center = center,
+        alpha = fade * 0.28f,
+        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f * (1f - p * 0.5f)),
+      )
+
+      particles.forEach { spec ->
+        val dist = baseRadius * (0.45f + p * spec.maxDistFactor)
+        val cx = center.x + cos(spec.angleRad) * dist
+        val cy = center.y + sin(spec.angleRad) * dist
+        val particleColor = if (spec.useSecondary) secondaryColor else primaryColor
+        val r = size.minDimension * spec.radiusFactor * (1f - p * 0.35f)
+
+        if (spec.isStar) {
+          val starPath =
+            Path().apply {
+              moveTo(cx, cy - r * 1.45f)
+              lineTo(cx + r * 0.42f, cy - r * 0.42f)
+              lineTo(cx + r * 1.45f, cy)
+              lineTo(cx + r * 0.42f, cy + r * 0.42f)
+              lineTo(cx, cy + r * 1.45f)
+              lineTo(cx - r * 0.42f, cy + r * 0.42f)
+              lineTo(cx - r * 1.45f, cy)
+              lineTo(cx - r * 0.42f, cy - r * 0.42f)
+              close()
+            }
+          drawPath(path = starPath, color = lerp(particleColor, Color.White, 0.35f), alpha = fade * 0.95f)
+        } else {
+          drawCircle(
+            color = particleColor,
+            radius = r * 0.9f,
+            center = Offset(cx, cy),
+            alpha = fade * 0.36f,
+          )
+          drawCircle(
+            color = lerp(particleColor, Color.White, 0.5f),
+            radius = r * 0.45f,
+            center = Offset(cx, cy),
+            alpha = fade * 0.95f,
+          )
+        }
+      }
+    }
+  }
+}

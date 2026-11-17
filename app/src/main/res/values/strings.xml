@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">MatusNotch</string>
+    <string name="studio_subtitle">Dynamic Island &amp; Mascot Studio</string>
+    <string name="tab_design">Design</string>
+    <string name="tab_widgets">Widgets</string>
+    <string name="tab_settings">Settings</string>
+    <string name="overlay_active">Floating Notch Active</string>
+    <string name="overlay_inactive">Floating Notch Paused</string>
+    <string name="overlay_enable_cta">Launch</string>
+    <string name="overlay_stop_cta">Stop</string>
+    <string name="cd_expand_notch">Expand MatusNotch</string>
+    <string name="cd_collapse_notch">Collapse MatusNotch</string>
+    <string name="cd_mascot_avatar">MatusNotch mascot</string>
+    <string name="accessibility_service_desc">Displays MatusNotch above the lockscreen and system bars without reading screen content.</string>
+</resources>

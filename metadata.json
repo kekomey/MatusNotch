@@ -1,0 +1,6 @@
+{
+  "name": "MatusNotch",
+  "description": "Customizable dynamic notch overlay and in-app studio with an animated reactive mascot and swipeable quick-action widgets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
